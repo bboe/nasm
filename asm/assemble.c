@@ -3551,10 +3551,62 @@ static enum match_result matches(const struct itemplate * const itemp,
  * 1 = 8-bit displacment
  * 2 = 16/32-bit displacement
  */
+/*
+ * Displacement self-shrink latch: speculate disp8 once for a forward
+ * (B - A) value just past disp8, reverting if it does not stick. Keyed by
+ * per-pass site order; spec_used persists across passes.
+ */
+static struct {
+    int64_t nalloc;
+    int64_t nused;
+    int64_t pass_seen;
+    uint8_t *spec_used;
+} disp_track = { 0, 0, -1, NULL };
+
+static int64_t disp_track_alloc(void)
+{
+    if (_passn != disp_track.pass_seen) {
+        disp_track.nused = 0;
+        disp_track.pass_seen = _passn;
+    }
+    int64_t i = disp_track.nused++;
+    if (i >= disp_track.nalloc) {
+        int64_t new_nalloc = disp_track.nalloc ? disp_track.nalloc * 2 : 256;
+        while (new_nalloc <= i)
+            new_nalloc *= 2;
+        size_t new_bytes = (size_t)(new_nalloc - disp_track.nalloc);
+        disp_track.spec_used = nasm_realloc(disp_track.spec_used, (size_t)new_nalloc);
+        memset(disp_track.spec_used + disp_track.nalloc, 0, new_bytes);
+        disp_track.nalloc = new_nalloc;
+    }
+    return i;
+}
+
+static bool disp_track_spec_used(int64_t i)
+{
+    return disp_track.spec_used && i < disp_track.nalloc && disp_track.spec_used[i];
+}
+
+static void disp_track_mark_spec_used(int64_t i)
+{
+    if (disp_track.spec_used && i < disp_track.nalloc)
+        disp_track.spec_used[i] = 1;
+}
+
+void disp_track_cleanup(void)
+{
+    nasm_free(disp_track.spec_used);
+    disp_track.spec_used = NULL;
+    disp_track.nalloc = 0;
+    disp_track.nused = 0;
+    disp_track.pass_seen = -1;
+}
+
 static unsigned int memory_mod(const int eaflags, insn *ins, int64_t o,
                                bool known, bool zerook)
 {
     struct ea_data * const output = &ins->ea;
+    const int64_t site = disp_track_alloc();
 
     /* Explicitly requested by user */
     if (eaflags & EAF_WORDOFFS) {
@@ -3581,7 +3633,21 @@ static unsigned int memory_mod(const int eaflags, insn *ins, int64_t o,
         return 0;
 
     /* 8-bit displacement possible? */
-    return output->disp8_ok ? 1 : 2;
+    if (output->disp8_ok)
+        return 1;
+
+    /* Forward self-shrink (non-EVEX): disp32 within disp8's saving. */
+    if (!(ins->opt & (OPTIM_STRICT_OPER | OPTIM_DISABLE_FWREF)) &&
+        output->disp8_shift == 0 && o > 127) {
+        const int dlong = (ins->addr_size == 16) ? 2 : 4;
+        const int64_t o_short = o - (dlong - 1);
+        if (o_short >= -128 && o_short <= 127 && !disp_track_spec_used(site)) {
+            disp_track_mark_spec_used(site);
+            return 1;
+        }
+    }
+
+    return 2;
 }
 
 static int process_ea(operand *input, int rfield, opflags_t rflags,

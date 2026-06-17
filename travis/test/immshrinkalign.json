@@ -1,0 +1,12 @@
+[
+	{
+		"description": "Immediate self-shrink convergence with align in span",
+		"id": "immshrinkalign",
+		"format": "bin",
+		"source": "immshrinkalign.asm",
+		"option": "-Ox",
+		"target": [
+			{ "output": "immshrinkalign.bin" }
+		]
+	}
+]

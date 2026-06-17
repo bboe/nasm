@@ -1,0 +1,12 @@
+[
+	{
+		"description": "Forward immediate (imm8) self-shrink",
+		"id": "immshrink",
+		"format": "bin",
+		"source": "immshrink.asm",
+		"option": "-Ox",
+		"target": [
+			{ "output": "immshrink.bin" }
+		]
+	}
+]

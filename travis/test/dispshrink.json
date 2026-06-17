@@ -1,0 +1,12 @@
+[
+	{
+		"description": "Forward displacement (disp8) self-shrink",
+		"id": "dispshrink",
+		"format": "bin",
+		"source": "dispshrink.asm",
+		"option": "-Ox",
+		"target": [
+			{ "output": "dispshrink.bin" }
+		]
+	}
+]

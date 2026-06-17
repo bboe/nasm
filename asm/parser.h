@@ -11,5 +11,6 @@
 
 insn *parse_line(char *buffer, insn *result, const int bits);
 void cleanup_insn(insn *instruction);
+void imm_track_cleanup(void);
 
 #endif

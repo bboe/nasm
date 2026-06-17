@@ -1,0 +1,12 @@
+[
+	{
+		"description": "Displacement self-shrink convergence with align in span",
+		"id": "dispshrinkalign",
+		"format": "bin",
+		"source": "dispshrinkalign.asm",
+		"option": "-Ox",
+		"target": [
+			{ "output": "dispshrinkalign.bin" }
+		]
+	}
+]
