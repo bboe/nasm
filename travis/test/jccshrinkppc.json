@@ -1,0 +1,12 @@
+[
+	{
+		"description": "jcc self-shrink convergence under preprocessor-coupled code size (PR #239)",
+		"id": "jccshrinkppc",
+		"format": "elf64",
+		"source": "jccshrinkppc.asm",
+		"option": "-Ox",
+		"target": [
+			{ "output": "jccshrinkppc.o" }
+		]
+	}
+]
