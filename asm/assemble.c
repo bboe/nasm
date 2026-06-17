@@ -18,6 +18,7 @@
 #include "insns.h"
 #include "tables.h"
 #include "disp8.h"
+#include "spec_latch.h"
 #include "listing.h"
 #include "dbginfo.h"
 
@@ -725,8 +726,10 @@ static struct {
     int64_t pass_seen;
     uint8_t *cur_was_near;
     uint8_t *prev_was_near;
-    uint8_t *spec_used;         /* persistent: speculated short at least once */
-} jmp_track = { 0, 0, -1, NULL, NULL, NULL };
+} jmp_track = { 0, 0, -1, NULL, NULL };
+
+/* jcc/jmp self-shrink latch, keyed by jmp_track index; see spec_latch.h. */
+static struct spec_latch jmp_latch = SPEC_LATCH_INIT;
 
 static int64_t jmp_track_alloc(void)
 {
@@ -738,10 +741,8 @@ static int64_t jmp_track_alloc(void)
         size_t new_bytes = (size_t)(new_nalloc - jmp_track.nalloc);
         jmp_track.prev_was_near = nasm_realloc(jmp_track.prev_was_near, (size_t)new_nalloc);
         jmp_track.cur_was_near = nasm_realloc(jmp_track.cur_was_near, (size_t)new_nalloc);
-        jmp_track.spec_used = nasm_realloc(jmp_track.spec_used, (size_t)new_nalloc);
         memset(jmp_track.prev_was_near + jmp_track.nalloc, 0, new_bytes);
         memset(jmp_track.cur_was_near + jmp_track.nalloc, 0, new_bytes);
-        memset(jmp_track.spec_used + jmp_track.nalloc, 0, new_bytes);
         jmp_track.nalloc = new_nalloc;
     }
     return i;
@@ -765,13 +766,12 @@ void jmp_track_cleanup(void)
 {
     nasm_free(jmp_track.cur_was_near);
     nasm_free(jmp_track.prev_was_near);
-    nasm_free(jmp_track.spec_used);
     jmp_track.cur_was_near = NULL;
     jmp_track.prev_was_near = NULL;
-    jmp_track.spec_used = NULL;
     jmp_track.nalloc = 0;
     jmp_track.nused = 0;
     jmp_track.pass_seen = -1;
+    spec_latch_free(&jmp_latch);
 }
 
 static bool jmp_track_prev_near(int64_t i)
@@ -783,35 +783,6 @@ static void jmp_track_record(int64_t i, bool was_near)
 {
     if (jmp_track.cur_was_near && i < jmp_track.nalloc)
         jmp_track.cur_was_near[i] = was_near;
-}
-
-/*
- * Bounded-speculation latch. The forward self-shrink re-check predicts
- * the post-shrink displacement assuming the span between the jump and
- * its target shifts rigidly. That holds for plain code, but an "align"
- * (or any position-dependent padding) between the jump and the target
- * makes the prediction wrong: shrinking the jump changes the padding,
- * so the speculative SHORT does not actually fit. Left unchecked the
- * jump oscillates NEAR<->SHORT forever and the relaxation never
- * converges.
- *
- * To guarantee termination we let each jump speculate at most once for
- * the whole assembly. After its single attempt it falls back to the
- * baseline current-layout test, which is convergent. If the speculative
- * SHORT was a true fixed point (rigid span) the baseline keeps it short;
- * if not, the baseline grows it back to NEAR and -- speculation now
- * spent -- it stays there. This bit therefore persists across passes
- * and is never cleared at pass boundaries.
- */
-static bool jmp_track_spec_used(int64_t i)
-{
-    return jmp_track.spec_used && i < jmp_track.nalloc && jmp_track.spec_used[i];
-}
-
-static void jmp_track_mark_spec_used(int64_t i)
-{
-    if (jmp_track.spec_used && i < jmp_track.nalloc)
-        jmp_track.spec_used[i] = 1;
 }
 
 /* This is a real hack. The jcc8 or jmp8 byte code must come first. */
@@ -844,6 +815,7 @@ jmp_match(const insn *ins, const struct itemplate *temp)
 
     jmp_track_check_new_pass();
     idx = jmp_track_alloc();
+    spec_latch_site(&jmp_latch);        /* keep jmp_latch sized to idx */
     prev_near = jmp_track_prev_near(idx);
 
     if (op0->opflags & OPFLAG_UNKNOWN) {
@@ -900,7 +872,7 @@ jmp_match(const insn *ins, const struct itemplate *temp)
              * stably short in the previous pass that have since grown
              * past 127 -- which then emit an out-of-range rel8.
              */
-            if (!prev_near || post_delta <= 0 || jmp_track_spec_used(idx)) {
+            if (!prev_near || post_delta <= 0 || spec_latch_used(&jmp_latch, idx)) {
                 jmp_track_record(idx, true);
                 return MERR_INVALOP;
             }
@@ -915,7 +887,7 @@ jmp_match(const insn *ins, const struct itemplate *temp)
                 return MERR_INVALOP;
             }
             /* Speculative SHORT accepted; spend this jump's one attempt. */
-            jmp_track_mark_spec_used(idx);
+            spec_latch_mark(&jmp_latch, idx);
         }
     }
     jmp_track_record(idx, false);
@@ -3551,62 +3523,19 @@ static enum match_result matches(const struct itemplate * const itemp,
  * 1 = 8-bit displacment
  * 2 = 16/32-bit displacement
  */
-/*
- * Displacement self-shrink latch: speculate disp8 once for a forward
- * (B - A) value just past disp8, reverting if it does not stick. Keyed by
- * per-pass site order; spec_used persists across passes.
- */
-static struct {
-    int64_t nalloc;
-    int64_t nused;
-    int64_t pass_seen;
-    uint8_t *spec_used;
-} disp_track = { 0, 0, -1, NULL };
-
-static int64_t disp_track_alloc(void)
-{
-    if (_passn != disp_track.pass_seen) {
-        disp_track.nused = 0;
-        disp_track.pass_seen = _passn;
-    }
-    int64_t i = disp_track.nused++;
-    if (i >= disp_track.nalloc) {
-        int64_t new_nalloc = disp_track.nalloc ? disp_track.nalloc * 2 : 256;
-        while (new_nalloc <= i)
-            new_nalloc *= 2;
-        size_t new_bytes = (size_t)(new_nalloc - disp_track.nalloc);
-        disp_track.spec_used = nasm_realloc(disp_track.spec_used, (size_t)new_nalloc);
-        memset(disp_track.spec_used + disp_track.nalloc, 0, new_bytes);
-        disp_track.nalloc = new_nalloc;
-    }
-    return i;
-}
-
-static bool disp_track_spec_used(int64_t i)
-{
-    return disp_track.spec_used && i < disp_track.nalloc && disp_track.spec_used[i];
-}
-
-static void disp_track_mark_spec_used(int64_t i)
-{
-    if (disp_track.spec_used && i < disp_track.nalloc)
-        disp_track.spec_used[i] = 1;
-}
+/* disp8 forward self-shrink latch; see spec_latch.h. */
+static struct spec_latch disp_latch = SPEC_LATCH_INIT;
 
 void disp_track_cleanup(void)
 {
-    nasm_free(disp_track.spec_used);
-    disp_track.spec_used = NULL;
-    disp_track.nalloc = 0;
-    disp_track.nused = 0;
-    disp_track.pass_seen = -1;
+    spec_latch_free(&disp_latch);
 }
 
 static unsigned int memory_mod(const int eaflags, insn *ins, int64_t o,
                                bool known, bool zerook)
 {
     struct ea_data * const output = &ins->ea;
-    const int64_t site = disp_track_alloc();
+    const int64_t site = spec_latch_site(&disp_latch);
 
     /* Explicitly requested by user */
     if (eaflags & EAF_WORDOFFS) {
@@ -3641,8 +3570,8 @@ static unsigned int memory_mod(const int eaflags, insn *ins, int64_t o,
         output->disp8_shift == 0 && o > 127) {
         const int dlong = (ins->addr_size == 16) ? 2 : 4;
         const int64_t o_short = o - (dlong - 1);
-        if (o_short >= -128 && o_short <= 127 && !disp_track_spec_used(site)) {
-            disp_track_mark_spec_used(site);
+        if (o_short >= -128 && o_short <= 127 && !spec_latch_used(&disp_latch, site)) {
+            spec_latch_mark(&disp_latch, site);
             return 1;
         }
     }

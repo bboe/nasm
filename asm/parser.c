@@ -19,6 +19,7 @@
 #include "floats.h"
 #include "assemble.h"
 #include "tables.h"
+#include "spec_latch.h"
 
 
 static int end_expression_next(void);
@@ -659,44 +660,12 @@ static bool add_prefix(insn *result)
     return true;
 }
 
-/*
- * Immediate self-shrink latch: speculate imm8 once for a forward (B - A)
- * value just past sbyte, reverting if it does not stick. Keyed by per-pass
- * immediate-operand order; spec_used persists across passes.
- */
-static struct {
-    int64_t nalloc;
-    int64_t nused;
-    int64_t pass_seen;
-    uint8_t *spec_used;
-} imm_track = { 0, 0, -1, NULL };
-
-static int64_t imm_track_alloc(void)
-{
-    if (_passn != imm_track.pass_seen) {
-        imm_track.nused = 0;
-        imm_track.pass_seen = _passn;
-    }
-    int64_t i = imm_track.nused++;
-    if (i >= imm_track.nalloc) {
-        int64_t new_nalloc = imm_track.nalloc ? imm_track.nalloc * 2 : 256;
-        while (new_nalloc <= i)
-            new_nalloc *= 2;
-        size_t new_bytes = (size_t)(new_nalloc - imm_track.nalloc);
-        imm_track.spec_used = nasm_realloc(imm_track.spec_used, (size_t)new_nalloc);
-        memset(imm_track.spec_used + imm_track.nalloc, 0, new_bytes);
-        imm_track.nalloc = new_nalloc;
-    }
-    return i;
-}
+/* imm8 forward self-shrink latch; see spec_latch.h. */
+static struct spec_latch imm_latch = SPEC_LATCH_INIT;
 
 void imm_track_cleanup(void)
 {
-    nasm_free(imm_track.spec_used);
-    imm_track.spec_used = NULL;
-    imm_track.nalloc = 0;
-    imm_track.nused = 0;
-    imm_track.pass_seen = -1;
+    spec_latch_free(&imm_latch);
 }
 
 /* Set value-specific immediate flags. */
@@ -709,7 +678,7 @@ static inline opflags_t set_imm_flags(struct operand *op, enum optimization opt)
     if (!(op->type & IMMEDIATE))
         return op->type;
 
-    site = imm_track_alloc();       /* one site per immediate operand */
+    site = spec_latch_site(&imm_latch);     /* one site per immediate operand */
 
     if (op->opflags & OPFLAG_UNKNOWN) {
         /* Be optimistic in pass 1 */
@@ -754,8 +723,8 @@ static inline opflags_t set_imm_flags(struct operand *op, enum optimization opt)
     if (!(opt & OPTIM_DISABLE_FWREF) && n > 127 && n <= 127 + 3 &&
         (int64_t)(int32_t)n == n) {
         const int64_t n_short = n - 3;
-        if ((int32_t)n_short == (int8_t)n_short && !imm_track.spec_used[site]) {
-            imm_track.spec_used[site] = 1;
+        if ((int32_t)n_short == (int8_t)n_short && !spec_latch_used(&imm_latch, site)) {
+            spec_latch_mark(&imm_latch, site);
             op->type |= SBYTEDWORD;
         }
     }
